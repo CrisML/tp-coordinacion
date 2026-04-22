@@ -8,54 +8,67 @@ ID = int(os.environ["ID"])
 MOM_HOST = os.environ["MOM_HOST"]
 OUTPUT_QUEUE = os.environ["OUTPUT_QUEUE"]
 SUM_AMOUNT = int(os.environ["SUM_AMOUNT"])
-SUM_PREFIX = os.environ["SUM_PREFIX"]
-AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 TOP_SIZE = int(os.environ["TOP_SIZE"])
 
 
 class AggregationFilter:
-
     def __init__(self):
         self.input_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{ID}"]
         )
-        self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
-            MOM_HOST, OUTPUT_QUEUE
-        )
-        self.fruit_top = []
+        self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, OUTPUT_QUEUE)
 
-    def _process_data(self, fruit, amount):
-        logging.info("Processing data message")
-        for i in range(len(self.fruit_top)):
-            if self.fruit_top[i].fruit == fruit:
-                self.fruit_top[i] = self.fruit_top[i] + fruit_item.FruitItem(
-                    fruit, amount
-                )
+        self.fruit_list = {}
+        self.eof_count = {}
+
+    def _process_data(self, query_id, fruit, amount):
+        lst = self.fruit_list.setdefault(query_id, [])
+        for i in range(len(lst)):
+            if lst[i].fruit == fruit:
+                lst[i] = lst[i] + fruit_item.FruitItem(fruit, amount)
                 return
-        bisect.insort(self.fruit_top, fruit_item.FruitItem(fruit, amount))
+        bisect.insort(lst, fruit_item.FruitItem(fruit, amount))
 
-    def _process_eof(self):
-        logging.info("Received EOF")
-        fruit_chunk = list(self.fruit_top[-TOP_SIZE:])
-        fruit_chunk.reverse()
-        fruit_top = list(
-            map(
-                lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
-                fruit_chunk,
-            )
-        )
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
-        del self.fruit_top
+    def _process_eof(self, query_id):
+        c = self.eof_count.get(query_id, 0) + 1
+        self.eof_count[query_id] = c
+        logging.info(f"[aggregation {ID}] EOF q={query_id} count={c}/{SUM_AMOUNT}")
+        if c < SUM_AMOUNT:
+            return
+
+        lst = self.fruit_list.get(query_id, [])
+        chunk = list(lst[-TOP_SIZE:])
+        chunk.reverse()
+        top = [(fi.fruit, fi.amount) for fi in chunk]
+
+        self.output_queue.send(message_protocol.internal.serialize([query_id, top]))
+        logging.info(f"[aggregation {ID}] FINISH q={query_id} sending top")
+
+        self.fruit_list.pop(query_id, None)
+        self.eof_count.pop(query_id, None)
 
     def process_messsage(self, message, ack, nack):
-        logging.info("Process message")
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
-            self._process_data(*fields)
-        else:
-            self._process_eof()
-        ack()
+        try:
+            fields = message_protocol.internal.deserialize(message)
+
+            if isinstance(fields, list) and len(fields) == 3:
+                query_id, fruit, amount = fields
+                self._process_data(query_id, fruit, amount)
+                ack()
+                return
+
+            if isinstance(fields, list) and len(fields) == 1:
+                query_id = fields[0]
+                self._process_eof(query_id)
+                ack()
+                return
+
+            logging.error(f"Invalid message format at Aggregation: {fields}")
+            ack()
+        except Exception as e:
+            logging.error(e)
+            nack(requeue=True)
 
     def start(self):
         self.input_exchange.start_consuming(self.process_messsage)
@@ -63,8 +76,7 @@ class AggregationFilter:
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    aggregation_filter = AggregationFilter()
-    aggregation_filter.start()
+    AggregationFilter().start()
     return 0
 
 

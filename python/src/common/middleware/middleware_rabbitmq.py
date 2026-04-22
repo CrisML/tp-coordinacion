@@ -1,7 +1,11 @@
-import pika
+import os
+import logging
+import threading
 import random
 import string
 from typing import Optional
+
+import pika
 
 from .middleware import (
     MessageMiddlewareQueue,
@@ -112,12 +116,17 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue, _BaseRabbitMQ):
                 exclusive=False,
                 auto_delete=False,
             )
-            # Fair dispatch para consumers
             self._channel.basic_qos(prefetch_count=1)
         except pika.exceptions.AMQPConnectionError as e:
             raise MessageMiddlewareDisconnectedError(str(e)) from e
         except Exception as e:
             raise MessageMiddlewareMessageError(str(e)) from e
+
+    def stop_consuming(self):
+        return _BaseRabbitMQ.stop_consuming(self)
+
+    def close(self):
+        return _BaseRabbitMQ.close(self)
 
     def send(self, message):
         self._ensure_connected()
@@ -171,12 +180,6 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue, _BaseRabbitMQ):
             self._consumer_tag = None
             raise MessageMiddlewareMessageError(str(e)) from e
 
-    def stop_consuming(self):
-        return _BaseRabbitMQ.stop_consuming(self)
-
-    def close(self):
-        return _BaseRabbitMQ.close(self)
-
 
 class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange, _BaseRabbitMQ):
     def __init__(self, host, exchange_name, routing_keys):
@@ -200,14 +203,21 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange, _BaseRabbitMQ
         except Exception as e:
             raise MessageMiddlewareMessageError(str(e)) from e
 
-    def send(self, message):
+    def stop_consuming(self):
+        return _BaseRabbitMQ.stop_consuming(self)
 
+    def close(self):
+        return _BaseRabbitMQ.close(self)
+
+    def send(self, message):
         self._ensure_connected()
         try:
             if not isinstance(message, (bytes, bytearray)):
                 raise MessageMiddlewareMessageError("message must be bytes")
             if len(self._routing_keys) < 1:
-                raise MessageMiddlewareMessageError("no routing keys configured for exchange")
+                raise MessageMiddlewareMessageError(
+                    "no routing keys configured for exchange"
+                )
 
             assert self._channel is not None
             for routing_key in self._routing_keys:
@@ -228,6 +238,7 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange, _BaseRabbitMQ
         self._ensure_connected()
         try:
             assert self._channel is not None
+
             if not self._queue_name:
                 self._queue_name = _random_name(f"{self._exchange_name}_q")
                 self._channel.queue_declare(
@@ -269,9 +280,3 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange, _BaseRabbitMQ
             self._consuming = False
             self._consumer_tag = None
             raise MessageMiddlewareMessageError(str(e)) from e
-
-    def stop_consuming(self):
-        return _BaseRabbitMQ.stop_consuming(self)
-
-    def close(self):
-        return _BaseRabbitMQ.close(self)

@@ -1,6 +1,7 @@
 import os
 import logging
 import threading
+import zlib
 
 from common import middleware, message_protocol, fruit_item
 
@@ -8,60 +9,162 @@ ID = int(os.environ["ID"])
 MOM_HOST = os.environ["MOM_HOST"]
 INPUT_QUEUE = os.environ["INPUT_QUEUE"]
 SUM_AMOUNT = int(os.environ["SUM_AMOUNT"])
-SUM_PREFIX = os.environ["SUM_PREFIX"]
-SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 
+EOF_QUEUE_PREFIX = os.environ.get("EOF_QUEUE_PREFIX", "sum_eof")
+PART_QUEUE_PREFIX = os.environ.get("PART_QUEUE_PREFIX", "sum_in")
+
+
+def _partition_for_fruit(fruit: str, mod: int) -> int:
+    return zlib.crc32(fruit.encode("utf-8")) % mod
+
+
 class SumFilter:
     def __init__(self):
-        self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
-            MOM_HOST, INPUT_QUEUE
-        )
-        self.data_output_exchanges = []
-        for i in range(AGGREGATION_AMOUNT):
-            data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+        self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, INPUT_QUEUE)
+
+        self.part_queue_name = f"{PART_QUEUE_PREFIX}_{ID}"
+        self.part_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, self.part_queue_name)
+
+        self.eof_queue_name = f"{EOF_QUEUE_PREFIX}_{ID}"
+        self.eof_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, self.eof_queue_name)
+
+        self.agg_exchanges = [
+            middleware.MessageMiddlewareExchangeRabbitMQ(
                 MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
             )
-            self.data_output_exchanges.append(data_output_exchange)
+            for i in range(AGGREGATION_AMOUNT)
+        ]
+
         self.amount_by_fruit = {}
+        self.closed = set()
 
-    def _process_data(self, fruit, amount):
-        logging.info(f"Process data")
-        self.amount_by_fruit[fruit] = self.amount_by_fruit.get(
-            fruit, fruit_item.FruitItem(fruit, 0)
-        ) + fruit_item.FruitItem(fruit, int(amount))
+    def _process_data(self, query_id, fruit, amount):
+        if query_id in self.closed:
+            return
+        per_query = self.amount_by_fruit.setdefault(query_id, {})
+        per_query[fruit] = per_query.get(fruit, fruit_item.FruitItem(fruit, 0)) + fruit_item.FruitItem(
+            fruit, int(amount)
+        )
 
-    def _process_eof(self):
-        logging.info(f"Broadcasting data messages")
-        for final_fruit_item in self.amount_by_fruit.values():
-            for data_output_exchange in self.data_output_exchanges:
-                data_output_exchange.send(
-                    message_protocol.internal.serialize(
-                        [final_fruit_item.fruit, final_fruit_item.amount]
-                    )
-                )
+    def _flush_query(self, query_id):
+        per_query = self.amount_by_fruit.get(query_id, {})
 
-        logging.info(f"Broadcasting EOF message")
-        for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(message_protocol.internal.serialize([]))
+        for final_fruit_item in per_query.values():
+            agg_id = _partition_for_fruit(final_fruit_item.fruit, AGGREGATION_AMOUNT)
+            payload = message_protocol.internal.serialize(
+                [query_id, final_fruit_item.fruit, final_fruit_item.amount]
+            )
+            self.agg_exchanges[agg_id].send(payload)
 
+        eof_payload = message_protocol.internal.serialize([query_id])
+        for ex in self.agg_exchanges:
+            ex.send(eof_payload)
 
-    def process_data_messsage(self, message, ack, nack):
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
-            self._process_data(*fields)
-        else:
-            self._process_eof(*fields)
-        ack()
+        self.amount_by_fruit.pop(query_id, None)
+
+    def _handle_eof_for_me(self, query_id):
+        if query_id in self.closed:
+            return
+        self.closed.add(query_id)
+        logging.info(f"[sum {ID}] flushing q={query_id}")
+        self._flush_query(query_id)
+
+    def _send_to_partition(self, partition_id: int, message_obj):
+        qname = f"{PART_QUEUE_PREFIX}_{partition_id}"
+        middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, qname).send(
+            message_protocol.internal.serialize(message_obj)
+        )
+
+    def _broadcast_partition_eof(self, query_id: str):
+        for pid in range(SUM_AMOUNT):
+            self._send_to_partition(pid, ["__EOF_PART__", query_id])
+
+        payload = message_protocol.internal.serialize([query_id])
+        for pid in range(SUM_AMOUNT):
+            qname = f"{EOF_QUEUE_PREFIX}_{pid}"
+            middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, qname).send(payload)
+
+    def process_dispatch_message(self, message, ack, nack):
+        """Consume desde input_queue y distribuye por partición."""
+        try:
+            fields = message_protocol.internal.deserialize(message)
+
+            if isinstance(fields, list) and len(fields) == 3 and fields[1] != "__EOF_BROADCAST__":
+                query_id, fruit, amount = fields
+                pid = _partition_for_fruit(fruit, SUM_AMOUNT)  # <-- FIX
+                self._send_to_partition(pid, [query_id, fruit, amount])
+                ack()
+                return
+
+            if isinstance(fields, list) and len(fields) == 2 and fields[1] == "__EOF_BROADCAST__":
+                query_id = fields[0]
+                logging.info(f"[sum {ID}] dispatch EOF_BROADCAST q={query_id}")
+                self._broadcast_partition_eof(query_id)
+                ack()
+                return
+
+            logging.error(f"Invalid message format at Sum(dispatch): {fields}")
+            ack()
+        except Exception as e:
+            logging.error(e)
+            nack(requeue=True)
+
+    def process_partition_message(self, message, ack, nack):
+        """Consume desde sum_in_{ID} (su partición)."""
+        try:
+            fields = message_protocol.internal.deserialize(message)
+
+            if isinstance(fields, list) and len(fields) == 3:
+                query_id, fruit, amount = fields
+                self._process_data(query_id, fruit, amount)
+                ack()
+                return
+
+            if isinstance(fields, list) and len(fields) == 2 and fields[0] == "__EOF_PART__":
+                _, query_id = fields
+                self._handle_eof_for_me(query_id)
+                ack()
+                return
+
+            logging.error(f"Invalid message format at Sum(part): {fields}")
+            ack()
+        except Exception as e:
+            logging.error(e)
+            nack(requeue=True)
+
+    def process_eof_message(self, message, ack, nack):
+        try:
+            ack()
+        except Exception:
+            nack(requeue=True)
 
     def start(self):
-        self.input_queue.start_consuming(self.process_data_messsage)
+        t = threading.Thread(
+            target=self.eof_queue.start_consuming,
+            args=(self.process_eof_message,),
+            daemon=True,
+        )
+        t.start()
+
+        tp = threading.Thread(
+            target=self.part_queue.start_consuming,
+            args=(self.process_partition_message,),
+            daemon=True,
+        )
+        tp.start()
+
+        if ID == 0:
+            logging.info(f"[sum {ID}] acting as dispatcher for {INPUT_QUEUE}")
+            self.input_queue.start_consuming(self.process_dispatch_message)
+        else:
+            threading.Event().wait()
+
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    sum_filter = SumFilter()
-    sum_filter.start()
+    SumFilter().start()
     return 0
 
 
