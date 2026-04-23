@@ -2,6 +2,7 @@ import os
 import logging
 import threading
 import zlib
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -37,8 +38,66 @@ class SumFilter:
             for i in range(AGGREGATION_AMOUNT)
         ]
 
+        self._partition_queues = [
+            middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, f"{PART_QUEUE_PREFIX}_{pid}")
+            for pid in range(SUM_AMOUNT)
+        ]
+
+        self._eof_queues = [
+            middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, f"{EOF_QUEUE_PREFIX}_{pid}")
+            for pid in range(SUM_AMOUNT)
+        ]
+
         self.amount_by_fruit = {}
         self.closed = set()
+        self._stop_event = threading.Event()
+
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
+
+    def _handle_sigterm(self, signum, frame):
+        logging.info(f"[sum {ID}] SIGTERM received, shutting down")
+        self._stop_event.set()
+        try:
+            self.input_queue.stop_consuming()
+        except Exception:
+            pass
+        try:
+            self.part_queue.stop_consuming()
+        except Exception:
+            pass
+        try:
+            self.eof_queue.stop_consuming()
+        except Exception:
+            pass
+
+        for q in getattr(self, "_partition_queues", []):
+            try:
+                q.close()
+            except Exception:
+                pass
+        for q in getattr(self, "_eof_queues", []):
+            try:
+                q.close()
+            except Exception:
+                pass
+        for ex in getattr(self, "agg_exchanges", []):
+            try:
+                ex.close()
+            except Exception:
+                pass
+
+        try:
+            self.input_queue.close()
+        except Exception:
+            pass
+        try:
+            self.part_queue.close()
+        except Exception:
+            pass
+        try:
+            self.eof_queue.close()
+        except Exception:
+            pass
 
     def _process_data(self, query_id, fruit, amount):
         if query_id in self.closed:
@@ -72,10 +131,7 @@ class SumFilter:
         self._flush_query(query_id)
 
     def _send_to_partition(self, partition_id: int, message_obj):
-        qname = f"{PART_QUEUE_PREFIX}_{partition_id}"
-        middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, qname).send(
-            message_protocol.internal.serialize(message_obj)
-        )
+        self._partition_queues[partition_id].send(message_protocol.internal.serialize(message_obj))
 
     def _broadcast_partition_eof(self, query_id: str):
         for pid in range(SUM_AMOUNT):
@@ -83,8 +139,7 @@ class SumFilter:
 
         payload = message_protocol.internal.serialize([query_id])
         for pid in range(SUM_AMOUNT):
-            qname = f"{EOF_QUEUE_PREFIX}_{pid}"
-            middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, qname).send(payload)
+            self._eof_queues[pid].send(payload)
 
     def process_dispatch_message(self, message, ack, nack):
         """Consume desde input_queue y distribuye por partición."""
@@ -93,7 +148,7 @@ class SumFilter:
 
             if isinstance(fields, list) and len(fields) == 3 and fields[1] != "__EOF_BROADCAST__":
                 query_id, fruit, amount = fields
-                pid = _partition_for_fruit(fruit, SUM_AMOUNT)  # <-- FIX
+                pid = _partition_for_fruit(fruit, SUM_AMOUNT)
                 self._send_to_partition(pid, [query_id, fruit, amount])
                 ack()
                 return
@@ -159,7 +214,7 @@ class SumFilter:
             logging.info(f"[sum {ID}] acting as dispatcher for {INPUT_QUEUE}")
             self.input_queue.start_consuming(self.process_dispatch_message)
         else:
-            threading.Event().wait()
+            self._stop_event.wait()
 
 
 def main():

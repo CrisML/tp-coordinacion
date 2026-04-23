@@ -1,6 +1,7 @@
 import os
 import logging
 import bisect
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -21,6 +22,23 @@ class AggregationFilter:
 
         self.fruit_list = {}
         self.eof_count = {}
+
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
+
+    def _handle_sigterm(self, signum, frame):
+        logging.info(f"[aggregation {ID}] SIGTERM received, shutting down")
+        try:
+            self.input_exchange.stop_consuming()
+        except Exception:
+            pass
+        try:
+            self.input_exchange.close()
+        except Exception:
+            pass
+        try:
+            self.output_queue.close()
+        except Exception:
+            pass
 
     def _process_data(self, query_id, fruit, amount):
         lst = self.fruit_list.setdefault(query_id, [])

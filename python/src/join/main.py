@@ -1,5 +1,6 @@
 import os
 import logging
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -17,6 +18,23 @@ class JoinFilter:
 
         self.count = {}
         self.acc = {}
+
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
+
+    def _handle_sigterm(self, signum, frame):
+        logging.info("[join] SIGTERM received, shutting down")
+        try:
+            self.input_queue.stop_consuming()
+        except Exception:
+            pass
+        try:
+            self.input_queue.close()
+        except Exception:
+            pass
+        try:
+            self.output_queue.close()
+        except Exception:
+            pass
 
     def _merge_partial(self, query_id, partial_top):
         acc = self.acc.setdefault(query_id, {})
