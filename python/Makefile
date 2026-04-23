@@ -35,3 +35,11 @@ switch:
 	@read -p "Selecciona uno [1-5]: " option;	\
 	cp ./scenarios/$${option}.yaml docker-compose.yaml
 .PHONY: switch
+
+deliver:
+	@echo "TEXTO DE ENTREGA:"
+	@echo "Branch: coordinacion"
+	@(cd "$(PWD)/.."; git config --get remote.origin.url | sed -E 's#(git@github.com:|https://github.com/)([^ ]+?)(\.git)?$$#Enlace: github.com/\2#')
+	@echo "Último commit:"
+	@(cd "$(PWD)/.."; git rev-parse HEAD)
+.PHONY: deliver
